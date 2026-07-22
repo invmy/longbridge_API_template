@@ -1,48 +1,41 @@
 import { Elysia, sse, t } from 'elysia'
 import { staticPlugin } from '@elysia/static'
-import { cors } from '@elysia/cors'
-import { openapi, fromTypes } from '@elysia/openapi'
 import * as Longbridge from 'longbridge'
-import { NaiveDatetime, NaiveDate, Time } from 'longbridge';
+
 const config = Longbridge.Config.fromApikeyEnv()
 const Tradectx = Longbridge.TradeContext.new(config)
 const Quotectx = Longbridge.QuoteContext.new(config)
+const Calendarctx = Longbridge.CalendarContext.new(config)
+const Contentctx = Longbridge.ContentContext.new(config)
+const Screenerctx = Longbridge.ScreenerContext.new(config)
+const Fundamentalctx = Longbridge.FundamentalContext.new(config)
 
-//quote订阅
+
 Quotectx.setOnQuote((err, event) => {
   if (err) {
     console.error("行情出错:", err);
     return;
   }
-  const q = event.data
-  const S = String(event.symbol)
-  const tv = {
-    s: 'ok',
-    n: `${S}`,
-    v: {
-      lp: Number(q.lastDone),
-      open_price: Number(q.open),
-      high_price: Number(q.high),
-      low_price: Number(q.low),
-      volume: Number(q.volume),
-    }
-  }
-  channel.send(String('quote'), JSON.stringify(tv));
+  const d = {
+    name: String(event.symbol),
+    data: event.data
+  };
+  channel.send(String('quote'), JSON.stringify(d));
 });
 
-//k线订阅
 Quotectx.setOnCandlestick((err, event) => {
   if (err) {
     console.error("行情出错:", err);
     return;
   }
+
   const B = event.data
-  const S = String(event.symbol)
+
   const data = {
-    name: S,
-    barsize: B.period,
+    name: String(event.symbol),
+    barsize: Number(B.period),
     bar: {
-      time: Math.floor(new Date().getTime()),
+      time: new Date(B.candlestick.timestamp).getTime(),
       open: Number(B.candlestick.open),
       high: Number(B.candlestick.high),
       low: Number(B.candlestick.low),
@@ -74,61 +67,79 @@ function createChannel() {
 }
 export const channel = createChannel()
 
-const app = new Elysia()
-  .use(openapi({
-    references: fromTypes()
-  }))
-  .use(staticPlugin({ assets: 'public', prefix: '/' }))
-  .use(cors())
+const cache = new Map<string, any>();
+const queue: (() => void)[] = [];
+let processing = false;
 
+const processQueue = () => {
+  if (processing || queue.length === 0) return;
+  processing = true;
+
+  const task = queue.shift();
+  task?.();
+
+  setTimeout(() => {
+    processing = false;
+    processQueue();
+  }, 1000);
+};
+
+const app = new Elysia()
+  .use(staticPlugin({ assets: 'public', prefix: '/' }))
   .listen(3000)
-  .get('/sse', async function* ({ set }) {
-    set.headers['Content-Type'] = 'text/event-stream';
-    set.headers['Cache-Control'] = 'no-cache';
-    set.headers['Connection'] = 'keep-alive';
+  .get('/sse', async function* () {
+
+    yield sse({ event: "system", data: { message: "系统已连接" } })
     for await (const { event, data } of channel) {
       yield sse({ event, data })
     }
   })
-  // .get("/", () => "Hello Elysia")
 
-  // .get("/balance", async () => {
-  //   return await Tradectx.accountBalance()
-  // })
-  .get('/info/:q', async ({ params: { q } }) => {
-    const symbol = q.toUpperCase();
-    return await Quotectx.staticInfo([symbol]);
-  }, {
-    params: t.Object({
-      q: t.String()
-    })
-  })
-  .get('/bars', async ({ query: { symbol, period, trade_session } }) => {
-    return await Quotectx.candlesticks(symbol, period, 1000, 1, trade_session);
+
+  .get("/quotes", ({ query }) => {
+    const rawSymbols = query.symbols || "";
+    const symbols = rawSymbols
+      .split(",")
+      .map(s => s.trim().toUpperCase())
+      .filter(s => s.length > 0);
+    return Quotectx.quote(symbols);
   }, {
     query: t.Object({
-      symbol: t.String(), period: t.Number(), trade_session: t.Number()//0盘中，100所有
+      symbols: t.Optional(t.String())
     })
   })
-  .get('/history', async ({ query: { symbol, period, trade_session, from, to, count } }) => {
-    return await Quotectx.historyCandlesticksByOffset(symbol, period, 1, false, fromSecondsToNaiveDatetime(to), count, trade_session);
-  }, {
-    query: t.Object({
-      symbol: t.String(), period: t.Number(), trade_session: t.Number(), from: t.Number(), to: t.Number(), count: t.Number()//0盘中，100所有
-    })
+  .get("/bars", async ({ query: { symbol, period = 14, adjustType = 1, start, end, sessions = 0 } }) => {
+    const toNaiveDate = (timestamp: any) => {
+      if (!timestamp) return null;
+      const date = new Date(Number(timestamp) * 1000);
+      if (isNaN(date.getTime())) return null;
+
+      return new Longbridge.NaiveDate(
+        date.getFullYear(),
+        date.getMonth() + 1,
+        date.getDate()
+      );
+    };
+
+    const startDate = toNaiveDate(start);
+    const endDate = toNaiveDate(end);
+
+    return await Quotectx.historyCandlesticksByDate(
+      (symbol).toUpperCase() as string,
+      Number(period) as Longbridge.Period,
+      Number(adjustType) as Longbridge.AdjustType,
+      startDate as any,
+      endDate as any,
+      Number(sessions) as any //0盘中,1全部
+    )
   })
 
   .get('/quote/:action/:symbol', async ({ params: { action, symbol } }) => {
-    const q = symbol.toUpperCase();
-
+    const symbols = symbol.split(',').map(s => s.trim().toUpperCase());
     if (action) {
-      await manager.add(q, 'quote', async () => {
-        await Quotectx.subscribe([q], [0]);
-      });
+      await Quotectx.subscribe(symbols, [0]);
     } else {
-      await manager.remove(q, async () => {
-        await Quotectx.unsubscribe([q], [0]);
-      });
+      await Quotectx.unsubscribe(symbols, [0]);
     }
     return await Quotectx.subscriptions();
   }, {
@@ -139,16 +150,10 @@ const app = new Elysia()
   })
 
   .get('/bar/:action/:symbol/:period', async ({ params: { action, symbol, period } }) => {
-    const q = `${symbol.toUpperCase()}_${period}`; // 唯一标识
-
     if (action) {
-      await manager.add(q, 'bar', async () => {
-        await Quotectx.subscribeCandlesticks(symbol.toUpperCase(), period, 1);
-      });
+      await Quotectx.subscribeCandlesticks(symbol.toUpperCase(), period, 1);
     } else {
-      await manager.remove(q, async () => {
-        await Quotectx.unsubscribeCandlesticks(symbol.toUpperCase(), period);
-      });
+      await Quotectx.unsubscribeCandlesticks(symbol.toUpperCase(), period);
     }
     return await Quotectx.subscriptions();
   }, {
@@ -159,69 +164,80 @@ const app = new Elysia()
     })
   })
 
-//......
+  .get("/info/:name", async ({ params, set }) => {
+    const symbol = params.name;
+
+    if (cache.has(symbol)) {
+      return cache.get(symbol);
+    }
+
+    return new Promise((resolve, reject) => {
+      queue.push(async () => {
+        try {
+
+          const data = await Fundamentalctx.company(symbol);
+          const company = Array.isArray(data) ? data[0] : data;
+          if (company && typeof company === 'object' && 'ticker' in company) {
+            cache.set(symbol, data);
+            resolve(data);
+          } else {
+            resolve({ error: "Symbol not found" });
+          }
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      processQueue();
+    });
+  })
+  .get("/news", ({ query: { symbol } }) => {
+    return Contentctx.news((symbol).toUpperCase());
+  }, {
+    query: t.Object({
+      symbol: t.String()
+    })
+  })
+  .get("/watchlists", () => {
+    return Quotectx.watchlist();
+  })
+  .get("/watchlist/new", async ({ query: { name, symbols } }) => {
+
+    const securities = symbols?.trim()
+      ? symbols.split(',').map(s => s.trim().toUpperCase())
+      : undefined;
+
+
+    return await Quotectx.createWatchlistGroup({ name, securities });
+  }, {
+    query: t.Object({
+      name: t.String(),
+      symbols: t.Optional(t.String())
+    })
+  })
+  .get("/watchlist/del", ({ query: { id } }) => {
+    return Quotectx.deleteWatchlistGroup({ id, purge: true });
+  }, {
+    query: t.Object({
+      id: t.Number()
+    })
+  })
+
+  .get("/watchlist/edit", ({ query: { action, id, name, symbols } }) => {
+    const list = symbols?.trim()
+      ? symbols.split(',').map(s => s.trim().toUpperCase())
+      : undefined;
+
+    return Quotectx.updateWatchlistGroup({ id: Number(id), name: String(name), securities: list, mode: Number(action) });
+  }, {
+    query: t.Object({
+      action: t.Number(),
+      id: t.Number(),
+      name: t.Optional(t.String()),
+      symbols: t.Optional(t.String()),
+    })
+  })
+
 console.log(
   `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
 );
-
-
-/**
- * 将秒级时间戳转换为 NaiveDatetime 对象
- * @param {number} timestampSeconds - 秒级时间戳
- * @returns {NaiveDatetime}
- */
-function fromSecondsToNaiveDatetime(timestampSeconds: any) {
-  // 1. 转为 JS Date 对象 (JS Date 需要毫秒，所以 * 1000)
-  const date = new Date(timestampSeconds * 1000);
-
-  // 2. 提取各项数值
-  const year = date.getFullYear();
-  const month = date.getMonth() + 1; // JS 月份从 0 开始，需要 +1
-  const day = date.getDate();
-  const hour = date.getHours();
-  const minute = date.getMinutes();
-  const second = date.getSeconds();
-
-  // 3. 实例化对应的组件对象
-  // 注意：这里的构造函数名称需根据你的 SDK 实际类名调整
-  const naiveDate = new NaiveDate(year, month, day);
-  const time = new Time(hour, minute, second);
-
-  // 4. 返回 NaiveDatetime 实例
-  return new NaiveDatetime(naiveDate, time);
-}
-
-class SubscriptionManager {
-  private subscriptionMap = new Map<string, string>(); // Key: symbol, Value: type(quote/bar)
-  private readonly MAX_LIMIT = 500;
-  private readonly THRESHOLD = 10;
-
-  async add(symbol: string, type: string, subscribeFn: () => Promise<void>) {
-    // 1. 如果已存在，先移除（为了更新顺序）
-    if (this.subscriptionMap.has(symbol)) {
-      this.subscriptionMap.delete(symbol);
-    }
-    // 2. 检查额度：如果可用额度 < 10 (即已用 > 490)
-    else if (this.subscriptionMap.size >= (this.MAX_LIMIT - this.THRESHOLD)) {
-      const oldestSymbol = this.subscriptionMap.keys().next().value;
-      if (oldestSymbol) {
-        console.log(`额度紧张，自动退订最旧标的: ${oldestSymbol}`);
-        // 这里需要根据实际业务逻辑调用对应的退订方法
-        await this.remove(oldestSymbol);
-      }
-    }
-
-    // 3. 执行订阅
-    await subscribeFn();
-    this.subscriptionMap.set(symbol, type);
-  }
-
-  async remove(symbol: string, unsubscribeFn?: () => Promise<void>) {
-    if (this.subscriptionMap.has(symbol)) {
-      if (unsubscribeFn) await unsubscribeFn();
-      this.subscriptionMap.delete(symbol);
-    }
-  }
-}
-
-const manager = new SubscriptionManager();
