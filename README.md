@@ -2,6 +2,10 @@
 
 ## Development
 
+```bash
+bun i
+```
+
 To start the development server run:
 
 ```bash
