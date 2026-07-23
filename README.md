@@ -18,6 +18,4 @@ https://longbridge.github.io/
 
 项目快速启动，已经写好部分接口如何启用对接还有订阅和推送逻辑。使用SSE进行推送，通过HTTP端点交互。
 
-# OpenAPI
-
-自动生成的api文档，访问 `http://localhost:3000/openapi`
+请勿以网站文档为准，大部分未及时更新。最新请根据NPM包的内容为准
